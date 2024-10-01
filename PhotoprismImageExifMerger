@@ -1,0 +1,234 @@
+import sys
+import os
+import shutil
+import logging
+import subprocess
+from pathlib import Path
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from typing import Any, Dict, List, Optional
+import yaml
+
+# User-configurable variables
+BASE_PATH = Path.home() / "Documents" / "Photoprism" # Change this to the base folder containing Images and Sidecar folders
+IMAGE_BASE_FOLDER = BASE_PATH / "Images"
+SIDECAR_BASE_FOLDER = BASE_PATH / "Sidecar"
+MAX_WORKERS = os.cpu_count() * 4
+
+# Metadata mapping dictionary
+METADATA_MAPPING = {
+    'TakenAt': 'DateTimeOriginal',
+    'Title': 'ObjectName',
+    'Description': 'ImageDescription',
+    'OriginalName': 'OriginalFilename',
+    'Altitude': 'GPSAltitude',
+    'Lat': 'GPSLatitude',
+    'Lng': 'GPSLongitude',
+    'ISO': 'ISO',
+    'Exposure': 'ExposureTime',
+    'FNumber': 'FNumber',
+    'FocalLength': 'FocalLength',
+    'CreatedBy': 'Artist',
+    'DocumentID': 'DocumentID',
+    'UID': 'InstanceID',
+    'Details.Keywords': 'Keywords',
+    'Details.Subject': 'Subject',
+    'Details.Software': 'Software',
+    'TakenAtLocal': 'XMP:LocalDateTimeOriginal',
+    'Quality': 'XMP:ImageQuality',
+    'TimeZone': 'XMP:TimeZone',
+}
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(processName)s - %(message)s'
+)
+
+
+def check_exiftool() -> None:
+    """Check if ExifTool is available in the system PATH."""
+    if shutil.which('exiftool') is None:
+        logging.error("ExifTool is not installed or not found in PATH.")
+        sys.exit(1)
+
+
+def flatten_metadata(metadata: Dict[str, Any], parent_key: str = '', sep: str = '.') -> Dict[str, Any]:
+    """
+    Flatten a nested dictionary.
+
+    Args:
+        metadata: The dictionary to flatten.
+        parent_key: The base key string.
+        sep: Separator between parent and child keys.
+
+    Returns:
+        A flat dictionary with concatenated keys.
+    """
+    items = {}
+    for k, v in metadata.items():
+        new_key = f"{parent_key}{sep}{k}" if parent_key else k
+        if isinstance(v, dict):
+            items.update(flatten_metadata(v, new_key, sep=sep))
+        else:
+            items[new_key] = v
+    return items
+
+
+def handle_gps_coordinate(value: Any, coordinate_type: str) -> List[str]:
+    """
+    Handle GPS coordinate (latitude or longitude) for exiftool command.
+
+    Args:
+        value: The coordinate value.
+        coordinate_type: 'Latitude' or 'Longitude'.
+
+    Returns:
+        A list of exiftool command arguments for the coordinate.
+    """
+    try:
+        coord_value = float(value)
+        ref = ''
+        if coordinate_type == 'Latitude':
+            ref = 'N' if coord_value >= 0 else 'S'
+        elif coordinate_type == 'Longitude':
+            ref = 'E' if coord_value >= 0 else 'W'
+        else:
+            raise ValueError("Invalid coordinate_type: must be 'Latitude' or 'Longitude'")
+        return [
+            f"-GPS{coordinate_type}={abs(coord_value)}",
+            f"-GPS{coordinate_type}Ref={ref}"
+        ]
+    except (ValueError, TypeError) as e:
+        logging.warning(f"Invalid {coordinate_type}: {value} ({e})")
+        return []
+
+
+def build_exif_command(metadata: Dict[str, Any]) -> List[str]:
+    """
+    Build the exiftool command based on the flattened metadata.
+
+    Args:
+        metadata: The metadata dictionary.
+
+    Returns:
+        A list representing the exiftool command.
+    """
+    exif_command = ["exiftool", "-overwrite_original", "-iptc:codedcharacterset=utf8"]
+    flat_metadata = flatten_metadata(metadata)
+
+    for full_key, value in flat_metadata.items():
+        mapped_key = METADATA_MAPPING.get(full_key, full_key)
+        if not value:
+            continue
+
+        try:
+            if mapped_key == 'GPSLatitude':
+                exif_command.extend(handle_gps_coordinate(value, 'Latitude'))
+            elif mapped_key == 'GPSLongitude':
+                exif_command.extend(handle_gps_coordinate(value, 'Longitude'))
+            elif mapped_key in ['Keywords', 'Subject']:
+                items = value if isinstance(value, list) else [item.strip() for item in value.split(',')]
+                for item in items:
+                    exif_command.extend([
+                        f"-IPTC:Keywords+={item}",
+                        f"-XMP-dc:Subject+={item}"
+                    ])
+            else:
+                exif_command.append(f"-{mapped_key}={value}")
+        except Exception as e:
+            logging.warning(f"Invalid value for {full_key}: {value} ({e})")
+    return exif_command
+
+
+def embed_metadata(image_path: Path, metadata: Dict[str, Any]) -> None:
+    """
+    Embed metadata into the image using exiftool.
+
+    Args:
+        image_path: Path to the image file.
+        metadata: Metadata dictionary to embed.
+    """
+    try:
+        exif_command = build_exif_command(metadata)
+        exif_command.append(str(image_path))
+        logging.info(f"Embedding metadata into {image_path}...")
+
+        result = subprocess.run(
+            exif_command,
+            capture_output=True,
+            text=True,
+            timeout=120
+        )
+        if result.returncode == 0:
+            logging.info(f"Successfully embedded metadata into {image_path}")
+        else:
+            logging.error(f"Error embedding metadata into {image_path}: {result.stderr.strip()}")
+    except subprocess.TimeoutExpired:
+        logging.error(f"ExifTool timed out for {image_path}")
+    except Exception as e:
+        logging.error(f"Failed to embed metadata into {image_path}: {e}")
+
+
+def find_corresponding_image(sidecar_file_path: Path) -> Optional[Path]:
+    """
+    Find the corresponding image file for a given sidecar file.
+
+    Args:
+        sidecar_file_path: Path to the sidecar file.
+
+    Returns:
+        Path to the corresponding image file if found, else None.
+    """
+    relative_path = sidecar_file_path.relative_to(SIDECAR_BASE_FOLDER)
+    base_image_path = (IMAGE_BASE_FOLDER / relative_path).with_suffix('')
+    possible_extensions = ['.jpeg', '.jpg', '.png', '.heic', '.tiff']
+
+    for ext in possible_extensions:
+        full_image_path = base_image_path.with_suffix(ext)
+        if full_image_path.exists():
+            return full_image_path
+    return None
+
+
+def process_single_file(sidecar_file_path: Path) -> None:
+    """
+    Process a single sidecar file: find the corresponding image and embed metadata.
+
+    Args:
+        sidecar_file_path: Path to the sidecar file.
+    """
+    image_file_path = find_corresponding_image(sidecar_file_path)
+    if image_file_path:
+        logging.info(f"Found image for {sidecar_file_path.name}: {image_file_path}")
+        try:
+            with sidecar_file_path.open('r') as yml_file:
+                metadata = yaml.safe_load(yml_file)
+            embed_metadata(image_file_path, metadata)
+        except Exception as e:
+            logging.error(f"Error reading sidecar file {sidecar_file_path}: {e}")
+    else:
+        logging.warning(f"Image not found for: {sidecar_file_path}")
+
+
+def process_files() -> None:
+    """
+    Process all sidecar files in the sidecar folder.
+    """
+    sidecar_files = list(SIDECAR_BASE_FOLDER.rglob("*.yml"))
+    logging.info(f"Found {len(sidecar_files)} sidecar files to process.")
+
+    with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(process_single_file, sidecar_file): sidecar_file for sidecar_file in sidecar_files}
+        for future in as_completed(futures):
+            sidecar_file = futures[future]
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"Error processing file {sidecar_file}: {e}")
+
+
+if __name__ == '__main__':
+    logging.info("Starting metadata embedding process...")
+    check_exiftool()
+    process_files()
+    logging.info("Metadata embedding process completed.")
